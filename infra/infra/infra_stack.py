@@ -1,9 +1,16 @@
 from aws_cdk import (
     Stack,
     Size,
+    CfnOutput,
+    Duration,
+    RemovalPolicy,
     aws_lex as lex,
     aws_iam as iam,
     aws_lambda as lambda_,
+    aws_apigateway as apigateway,
+    aws_s3 as s3,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
 )
 from constructs import Construct
 import os
@@ -44,6 +51,16 @@ class InfraChatbotStack(Stack):
         )
         role_lambda.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
+        )
+
+        ## Create Lex Lambda role for lex inference
+        role_lex_lambda = iam.Role(
+            self, "LexLambdaRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole"),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonLexFullAccess")
+            ]
         )
 
         # Create fulfilment Lambda function
@@ -111,6 +128,9 @@ class InfraChatbotStack(Stack):
                             sample_utterances=[
                                 lex.CfnBot.SampleUtteranceProperty(utterance=utterance)
                                 for utterance in [
+                                    "music",
+                                    "Suggest some music",
+                                    "Recommend a song",
                                     "Recommend me some music",
                                     "I want to listen to music",
                                     "Suggest a song for me",
@@ -221,4 +241,146 @@ class InfraChatbotStack(Stack):
                     ]
                 )
             ]
+        )
+
+        # Create api Lambda function
+        lambda_api = lambda_.Function(
+            self, "LambdaApi",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="lambda_function.handler",
+            code=lambda_.Code.from_asset(
+                path=os.path.join("..", "backend", "lambda_api"),
+                bundling={
+                    "image": lambda_.Runtime.PYTHON_3_12.bundling_image,
+                    "command": [
+                        "bash", "-c",
+                        "pip install -r requirements.txt -t /asset-output && cp lambda_function.py /asset-output"
+                    ]
+                }
+            ),
+            role=role_lex_lambda,
+            memory_size=1024,
+            ephemeral_storage_size=Size.mebibytes(1024),
+            environment={
+                "LEX_BOT_ID": bot.attr_id,
+                "LEX_BOT_ALIAS_ID": "TSTALIASID",
+                "LEX_LOCALE_ID": "en_US"
+            }
+        )
+
+        # Grant Lex permission to invoke Lambda
+        lambda_api.add_permission(
+            "LexInvokePermission",
+            principal=iam.ServicePrincipal("lexv2.amazonaws.com"),
+            source_arn=f"arn:aws:lex:{self.region}:{self.account}:bot-alias/*/*"
+        )
+
+        # API Gateway REST API (Option 1A)
+        api = apigateway.LambdaRestApi(
+            self, "FastAPIGateway",
+            handler=lambda_api,
+            proxy=True,  # Proxy all requests to Lambda
+            default_cors_preflight_options=apigateway.CorsOptions(
+                allow_origins=apigateway.Cors.ALL_ORIGINS,
+                allow_methods=apigateway.Cors.ALL_METHODS,
+                allow_headers=["*"]
+            )
+        )
+
+        # S3 Bucket for React App
+        frontend_bucket = s3.Bucket(
+            self, "ChatbotFrontendBucket",
+            # RemovalPolicy.DESTROY is for dev/testing, use RETAIN in production
+            removal_policy=RemovalPolicy.DESTROY,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL
+        )
+        logging_bucket = s3.Bucket(
+            self, "CloudFrontLoggingBucket",
+            object_ownership=s3.ObjectOwnership.OBJECT_WRITER,  # ✅ Enables ACLs
+            removal_policy=RemovalPolicy.DESTROY  # Optional, for cleanup in dev
+        )
+
+        # CloudFront Origin Access Identity (OAI) for S3
+        oai = cloudfront.OriginAccessIdentity(
+            self, "ChatbotFrontendOAI",
+            comment="OAI for CloudFront to access S3 bucket"
+        )
+
+        # Grant OAI read access to the S3 bucket
+        frontend_bucket.grant_read(oai)
+
+        # CloudFront Distribution
+        distribution = cloudfront.Distribution(
+            self, "ChatbotCloudFrontDistribution",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3Origin(frontend_bucket, origin_access_identity=oai),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
+            ),
+            default_root_object="index.html",
+            error_responses=[
+                cloudfront.ErrorResponse(
+                    http_status=403,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=Duration.seconds(0)
+                ),
+                cloudfront.ErrorResponse(
+                    http_status=404,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=Duration.seconds(0)
+                )
+            ],
+            log_bucket=logging_bucket
+        )
+
+        # Output the CloudFront URL
+        CfnOutput(
+            self,
+            "CloudFrontUrl",
+            value=f"https://{distribution.distribution_domain_name}",
+            export_name="CloudFrontUrl"
+        )
+
+        # Save the API URL
+        CfnOutput(
+            self,
+            "APIEndpoint",
+            value=api.url,
+            export_name="APIEndpoint"
+        )
+
+        # Save bot id
+        CfnOutput(
+            self,
+            "LexBotId",
+            value=bot.ref,  # this is the bot ID
+            export_name="LexBotId"
+        )
+    
+        # Output S3 bucket name
+        CfnOutput(
+            self,
+            "WebsiteBucketName",
+            value=frontend_bucket.bucket_name,
+            export_name="WebsiteBucketName",
+            description="S3 bucket name for the static website"
+        )
+
+        # Output CloudFront distribution URL
+        CfnOutput(
+            self,
+            "WebsiteURL",
+            value=f"https://{distribution.distribution_domain_name}",
+            export_name="WebsiteURL",
+            description="CloudFront distribution URL for the chatbot website"
+        )
+
+        # Output CloudFront distribution ID
+        CfnOutput(
+            self,
+            "DistributionId",
+            value=distribution.distribution_id,
+            export_name="DistributionId",
+            description="CloudFront distribution ID for cache invalidation"
         )
