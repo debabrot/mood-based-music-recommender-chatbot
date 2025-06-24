@@ -9,8 +9,7 @@ This project is designed as a portfolio piece to showcase chatbot development, s
 
 ## ✨ Demo
 
-
-> 🔗 <video controls src="assets/demo.gif" title="Title"></video>
+![Demo of bot](assets/demo.gif)
 
 ---
 
